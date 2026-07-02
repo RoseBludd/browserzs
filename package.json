@@ -3,8 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "bun run server.ts",
-    "postinstall": "npx playwright install chromium --with-deps 2>/dev/null || true"
+    "start": "bun run server.ts"
   },
   "dependencies": {
     "playwright": "^1.52.0"

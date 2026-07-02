@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
 COPY package.json bun.lockb* ./
 RUN bun install --production
 
-RUN npx playwright install chromium --with-deps
+RUN bun x playwright install chromium --with-deps
 
 COPY . .
 
