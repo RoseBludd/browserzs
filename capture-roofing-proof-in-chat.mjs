@@ -1,15 +1,31 @@
 /**
  * Proof-in-chat recapture — bluebonnetpeakroofing app embed.
  * Frames the message scroller (not seat rail). DOM-validates inline assistant evidence before save.
- * See workflows/proof-in-chat.md.
+ *
+ * One Chromium launch and one tenant login per process; scenarios run in the same browser context/page.
+ *
+ * Environment:
+ *   ROOFERZS_MEDIA_DIR          — PNG/webm output dir (default: this agent's Project store …/media)
+ *   ROOFERZS_SCENARIOS          — Comma IDs to run (e.g. E1,E2,S1); default = full chat matrix
+ *   ROOFERZS_CHAT_ONLY          — Deprecated alias for ROOFERZS_SCENARIOS
+ *   ROOFERZS_CHAT_INCLUDE_S1S2  — Set to 1 to include S1/S2 storm+canvass in default matrix
+ *   ROOFERZS_CHAT_INCLUDE_S5    — Set to 0 to skip S5 after E1/E2 coordinator gate (default: run when ready)
+ *   ROOFERZS_CHAT_SURFACE       — full-panel | embed | standalone (default: full-panel)
+ *   ROOFERZS_CLIP_PER_SCENARIO  — Set to 1 to write a short .webm per passed scenario (same session)
+ *   ROOFERZS_MCP_TURN_TIMEOUT_MS — Max wait per assistant turn (default: 1500000)
+ *   ROOFERZS_CHAT_MAX_RESENDS   — Network-error resend cap (default: 1)
+ *   ROOFERZS_NETWORK_ERROR_GRACE_MS — Grace before resend on network error (default: 180000)
+ *   ROOFERZS_CHAT_LANE            — email | field — preset scenario order when ROOFERZS_SCENARIOS unset
  */
 import { chromium } from 'playwright';
+import { execSync } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 const MEDIA_DIR =
   process.env.ROOFERZS_MEDIA_DIR?.trim() ||
-  '/root/.local/state/cursor/agent-stores/cursor_agent_stores/bc-49d94244-10a5-4a36-a7e1-22be46f6c8c8/files/media';
+  '/root/.local/state/cursor/agent-stores/cursor_agent_stores/bc-f91f83f7-d8c2-501a-b929-f9b3ecf5829d/files/media';
 
 const TENANT = 'bluebonnetpeakroofing';
 const EMAIL = 'jordan.hale+restart1790915600@mailinator.com';
@@ -21,15 +37,16 @@ const INCLUDE_STORM_CANVASS =
 const INCLUDE_S5_AFTER_E1E2 = process.env.ROOFERZS_CHAT_INCLUDE_S5 !== '0';
 /** embed iframe is ~560px → mobile rail-only; use Full agent tab for proof-in-chat framing */
 const CHAT_SURFACE = process.env.ROOFERZS_CHAT_SURFACE?.trim() || 'full-panel';
-const CHAT_ONLY = process.env.ROOFERZS_CHAT_ONLY?.trim()
-  ? process.env.ROOFERZS_CHAT_ONLY.split(',').map((s) => s.trim()).filter(Boolean)
-  : null;
-/** One login + one browser per run; new chat thread between scenarios (no logout). */
-const SINGLE_SESSION =
-  process.env.ROOFERZS_SINGLE_SESSION === '1' ||
-  process.env.ROOFERZS_SINGLE_SESSION === 'true' ||
-  (process.env.ROOFERZS_SINGLE_SESSION !== '0' &&
-    (!!CHAT_LANE || (CHAT_ONLY && CHAT_ONLY.length > 1)));
+const CLIP_PER_SCENARIO = process.env.ROOFERZS_CLIP_PER_SCENARIO === '1';
+
+function scenarioIdsFromEnv() {
+  const raw =
+    process.env.ROOFERZS_SCENARIOS?.trim() || process.env.ROOFERZS_CHAT_ONLY?.trim() || '';
+  if (!raw) return null;
+  return raw.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+const SCENARIO_FILTER = scenarioIdsFromEnv();
 
 const LANE_SCENARIO_ORDER = {
   email: ['E1', 'E2', 'E5', 'E4', 'E3'],
@@ -571,6 +588,131 @@ async function openEmbedAgent(page) {
   return iframe;
 }
 
+async function createClipRecorder(page) {
+  const client = await page.context().newCDPSession(page);
+  const frames = [];
+  const handler = async (payload) => {
+    frames.push(Buffer.from(payload.data, 'base64'));
+    await client.send('Page.screencastFrameAck', { sessionId: payload.sessionId }).catch(() => {});
+  };
+  client.on('Page.screencastFrame', handler);
+  await client.send('Page.startScreencast', {
+    format: 'jpeg',
+    quality: 75,
+    maxWidth: 1280,
+    maxHeight: 720,
+    everyNthFrame: 2,
+  });
+  return {
+    async stop(outPath) {
+      await client.send('Page.stopScreencast').catch(() => {});
+      client.removeListener('Page.screencastFrame', handler);
+      if (frames.length < 2) return false;
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'roof-chat-clip-'));
+      try {
+        frames.forEach((buf, i) =>
+          fs.writeFileSync(path.join(tmpDir, `f${String(i).padStart(5, '0')}.jpg`), buf),
+        );
+        execSync(
+          `ffmpeg -y -framerate 4 -i "${tmpDir}/f%05d.jpg" -c:v libvpx-vp9 -b:v 600k -an "${outPath}"`,
+          { stdio: 'pipe' },
+        );
+        return fs.existsSync(outPath);
+      } catch {
+        return false;
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
+function orderScenariosByIds(scenarios, ids) {
+  const byId = new Map(scenarios.map((s) => [s.id, s]));
+  if (!ids?.length) return scenarios;
+  return ids.map((id) => byId.get(id)).filter(Boolean);
+}
+
+function buildRunList() {
+  let list;
+  if (SCENARIO_FILTER?.length) {
+    list = orderScenariosByIds(SCENARIOS, SCENARIO_FILTER);
+  } else if (CHAT_LANE && LANE_SCENARIO_ORDER[CHAT_LANE]) {
+    list = orderScenariosByIds(SCENARIOS, LANE_SCENARIO_ORDER[CHAT_LANE]);
+  } else {
+    list = [...SCENARIOS];
+  }
+  const wantS5 =
+    INCLUDE_S5_AFTER_E1E2 && (!SCENARIO_FILTER || SCENARIO_FILTER.includes('S5'));
+  if (wantS5 && !list.some((s) => s.id === 'S5')) {
+    list = [...list, S5_SCENARIO];
+  }
+  return list;
+}
+
+async function runScenarioInSession(page, chatTarget, sc, meta) {
+  const outPath = path.join(MEDIA_DIR, sc.file);
+  let clipRecorder = null;
+  try {
+    await freshChatThread(page);
+    await selectSeat(chatTarget, sc.seat, sc.seatRe);
+    const c = await composer(chatTarget);
+    if (CLIP_PER_SCENARIO) {
+      clipRecorder = await createClipRecorder(page);
+    }
+    await c.fill(sc.prompt);
+    await c.press('Enter');
+    const turn = await waitForRichTurn(
+      chatTarget,
+      page,
+      sc.prompt,
+      sc.mustHave,
+      sc.inline,
+      undefined,
+      sc.forbidInfra === true,
+    );
+    const dom = await screenshotChatProof(chatTarget, outPath, sc.prompt, sc.inline);
+    publishPass(outPath, sc.id);
+    const scenarioMeta = {
+      ok: true,
+      file: sc.file,
+      path: outPath,
+      dom,
+      excerpt: turn.excerpt.slice(0, 400),
+    };
+    if (clipRecorder) {
+      const webmPath = outPath.replace(/\.png$/i, '.webm');
+      if (await clipRecorder.stop(webmPath)) {
+        scenarioMeta.clip = webmPath;
+      }
+      clipRecorder = null;
+    }
+    meta.scenarios[sc.id] = scenarioMeta;
+    meta.passedPaths.push(outPath);
+    return true;
+  } catch (e) {
+    const failPath = path.join(INTERNAL_FAIL_DIR, sc.file.replace('.png', '-FAILED.png'));
+    await chatTarget
+      ?.locator('[data-slot="message-scroller-viewport"]')
+      .first()
+      .screenshot({ path: failPath })
+      .catch(() => {});
+    if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+    meta.scenarios[sc.id] = {
+      ok: false,
+      file: sc.file,
+      error: String(e.message || e),
+      debugScreenshot: failPath,
+    };
+    meta.errors.push(`${sc.id}: ${e.message || e}`);
+    return false;
+  } finally {
+    if (clipRecorder) {
+      await clipRecorder.stop(path.join(MEDIA_DIR, `.clip-abort-${sc.id}.webm`)).catch(() => {});
+    }
+  }
+}
+
 async function openChatTarget(page) {
   if (CHAT_SURFACE === 'embed') {
     return { target: await openEmbedAgent(page), surface: 'app-embed-iframe' };
@@ -589,52 +731,12 @@ async function openChatTarget(page) {
   return { target: await openFullPanelAgent(page), surface: 'app-embed-full-panel' };
 }
 
-function orderScenariosByIds(scenarios, ids) {
-  const byId = new Map(scenarios.map((s) => [s.id, s]));
-  if (!ids?.length) return scenarios;
-  return ids.map((id) => byId.get(id)).filter(Boolean);
-}
-
-function resolveScenarioIds() {
-  if (CHAT_ONLY?.length) return CHAT_ONLY;
-  if (CHAT_LANE && LANE_SCENARIO_ORDER[CHAT_LANE]) return LANE_SCENARIO_ORDER[CHAT_LANE];
-  return null;
-}
-
 function publishPass(outPath, scenarioId) {
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   if (!fs.existsSync(outPath)) return;
   const stamp = path.join(MEDIA_DIR, `.roofing-pass-${scenarioId}.stamp`);
   fs.writeFileSync(stamp, `${new Date().toISOString()}\n${outPath}\n`);
   console.log(`[PASS] ${scenarioId} → ${outPath}`);
-}
-
-async function runScenarioInSession(page, chatTarget, sc, meta) {
-  const outPath = path.join(MEDIA_DIR, sc.file);
-  await freshChatThread(page);
-  await selectSeat(chatTarget, sc.seat, sc.seatRe);
-  const c = await composer(chatTarget);
-  await c.fill(sc.prompt);
-  await c.press('Enter');
-  const turn = await waitForRichTurn(
-    chatTarget,
-    page,
-    sc.prompt,
-    sc.mustHave,
-    sc.inline,
-    undefined,
-    sc.forbidInfra === true,
-  );
-  const dom = await screenshotChatProof(chatTarget, outPath, sc.prompt, sc.inline);
-  publishPass(outPath, sc.id);
-  meta.scenarios[sc.id] = {
-    ok: true,
-    file: sc.file,
-    path: outPath,
-    dom,
-    excerpt: turn.excerpt.slice(0, 400),
-  };
-  meta.passedPaths.push(outPath);
 }
 
 const meta = {
@@ -646,7 +748,7 @@ const meta = {
   ok: false,
   errors: [],
 };
-if (CHAT_ONLY?.length === 1 && CHAT_ONLY[0] === 'S5') {
+if (SCENARIO_FILTER?.length === 1 && SCENARIO_FILTER[0] === 'S5') {
   for (const name of REQUIRED_CHAT_FILES) {
     const p = path.join(MEDIA_DIR, name);
     if (fs.existsSync(p)) meta.passedPaths.push(p);
@@ -657,155 +759,40 @@ const browser = await chromium.launch({
   args: ['--disable-dev-shm-usage', '--no-sandbox'],
 });
 
-meta.singleSession = SINGLE_SESSION;
+meta.singleSession = true;
 meta.chatLane = CHAT_LANE || null;
 
+const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+const page = await context.newPage();
+let chatTarget = null;
+
+function coordinatorPrereqMet() {
+  return (
+    REQUIRED_CHAT_FILES.every((f) => meta.passedPaths.includes(path.join(MEDIA_DIR, f))) ||
+    REQUIRED_CHAT_FILES.every((f) => fs.existsSync(path.join(MEDIA_DIR, f)))
+  );
+}
+
 try {
-  const scenarioIds = resolveScenarioIds();
-  const runList = scenarioIds
-    ? orderScenariosByIds(SCENARIOS, scenarioIds)
-    : SCENARIOS;
+  await login(page);
+  const opened = await openChatTarget(page);
+  chatTarget = opened.target;
+  meta.chatSurfaceResolved = opened.surface;
 
-  async function recordScenarioFailure(sc, chatTarget, e) {
-    const outPath = path.join(MEDIA_DIR, sc.file);
-    const failPath = path.join(INTERNAL_FAIL_DIR, sc.file.replace('.png', '-FAILED.png'));
-    await chatTarget
-      ?.locator('[data-slot="message-scroller-viewport"]')
-      .first()
-      .screenshot({ path: failPath })
-      .catch(() => {});
-    if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
-    meta.scenarios[sc.id] = {
-      ok: false,
-      file: sc.file,
-      error: String(e.message || e),
-      debugScreenshot: failPath,
-    };
-    meta.errors.push(`${sc.id}: ${e.message || e}`);
+  for (const sc of buildRunList()) {
+    if (sc.requiresCoordinatorReady && !coordinatorPrereqMet()) {
+      meta.scenarios[sc.id] = { ok: false, skipped: true, reason: 'coordinator E1/E2 not ready' };
+      continue;
+    }
+    await runScenarioInSession(page, chatTarget, sc, meta);
+    await sleep(2000);
+    meta.at = new Date().toISOString();
+    fs.writeFileSync(SUMMARY, JSON.stringify(meta, null, 2));
   }
 
-  if (SINGLE_SESSION && runList.length > 0) {
-    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-    const page = await context.newPage();
-    let chatTarget = null;
-    try {
-      await login(page);
-      const opened = await openChatTarget(page);
-      chatTarget = opened.target;
-      meta.chatSurfaceResolved = opened.surface;
-      for (const sc of runList) {
-        try {
-          await runScenarioInSession(page, chatTarget, sc, meta);
-        } catch (e) {
-          await recordScenarioFailure(sc, chatTarget, e);
-        }
-        await sleep(2000);
-        meta.at = new Date().toISOString();
-        fs.writeFileSync(SUMMARY, JSON.stringify(meta, null, 2));
-      }
-    } finally {
-      await context.close().catch(() => {});
-    }
-  } else {
-    for (const sc of runList) {
-      const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-      const page = await context.newPage();
-      let chatTarget = null;
-      const outPath = path.join(MEDIA_DIR, sc.file);
-      try {
-        await login(page);
-        const opened = await openChatTarget(page);
-        chatTarget = opened.target;
-        meta.chatSurfaceResolved = opened.surface;
-        await freshChatThread(page);
-        await selectSeat(chatTarget, sc.seat, sc.seatRe);
-        const c = await composer(chatTarget);
-        await c.fill(sc.prompt);
-        await c.press('Enter');
-        const turn = await waitForRichTurn(
-          chatTarget,
-          page,
-          sc.prompt,
-          sc.mustHave,
-          sc.inline,
-          undefined,
-          sc.forbidInfra === true,
-        );
-        const dom = await screenshotChatProof(chatTarget, outPath, sc.prompt, sc.inline);
-        publishPass(outPath, sc.id);
-        meta.scenarios[sc.id] = {
-          ok: true,
-          file: sc.file,
-          path: outPath,
-          dom,
-          excerpt: turn.excerpt.slice(0, 400),
-        };
-        meta.passedPaths.push(outPath);
-      } catch (e) {
-        await recordScenarioFailure(sc, chatTarget, e);
-      } finally {
-        await context.close().catch(() => {});
-      }
-      await sleep(2000);
-    }
-  }
   meta.ok = meta.errors.length === 0;
   meta.coordinatorReady =
-    meta.ok &&
     REQUIRED_CHAT_FILES.every((f) => meta.passedPaths.includes(path.join(MEDIA_DIR, f)));
-
-  const runS5 =
-    INCLUDE_S5_AFTER_E1E2 &&
-    (meta.coordinatorReady || (CHAT_ONLY?.includes('S5') && REQUIRED_CHAT_FILES.every((f) => meta.passedPaths.includes(path.join(MEDIA_DIR, f))))) &&
-    (!CHAT_ONLY || CHAT_ONLY.includes('S5') || meta.coordinatorReady);
-  if (runS5 && (!CHAT_ONLY || CHAT_ONLY.includes('S5') || meta.coordinatorReady)) {
-    const sc = S5_SCENARIO;
-    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-    const page = await context.newPage();
-    let chatTarget = null;
-    const outPath = path.join(MEDIA_DIR, sc.file);
-    try {
-      await login(page);
-      const opened = await openChatTarget(page);
-      chatTarget = opened.target;
-      await freshChatThread(page);
-      await selectSeat(chatTarget, sc.seat, sc.seatRe);
-      const c = await composer(chatTarget);
-      await c.fill(sc.prompt);
-      await c.press('Enter');
-      const turn = await waitForRichTurn(
-        chatTarget,
-        page,
-        sc.prompt,
-        sc.mustHave,
-        sc.inline,
-        undefined,
-        sc.forbidInfra === true,
-      );
-      const dom = await screenshotChatProof(chatTarget, outPath, sc.prompt, sc.inline);
-      meta.scenarios[sc.id] = {
-        ok: true,
-        file: sc.file,
-        path: outPath,
-        dom,
-        excerpt: turn.excerpt.slice(0, 400),
-      };
-      meta.passedPaths.push(outPath);
-    } catch (e) {
-      const failPath = path.join(INTERNAL_FAIL_DIR, sc.file.replace('.png', '-FAILED.png'));
-      await chatTarget
-        ?.locator('[data-slot="message-scroller-viewport"]')
-        .first()
-        .screenshot({ path: failPath })
-        .catch(() => {});
-      if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
-      meta.scenarios[sc.id] = { ok: false, file: sc.file, error: String(e.message || e) };
-      meta.errors.push(`${sc.id}: ${e.message || e}`);
-      meta.coordinatorReady = false;
-    } finally {
-      await context.close().catch(() => {});
-    }
-  }
 } catch (e) {
   meta.errors.push(String(e.message || e));
 } finally {
@@ -813,6 +800,7 @@ try {
     const failed = path.join(MEDIA_DIR, name.replace('.png', '-FAILED.png'));
     if (fs.existsSync(failed)) fs.unlinkSync(failed);
   }
+  await context.close().catch(() => {});
   await browser.close().catch(() => {});
 }
 
