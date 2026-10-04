@@ -25,7 +25,7 @@ import path from 'path';
 
 const MEDIA_DIR =
   process.env.ROOFERZS_MEDIA_DIR?.trim() ||
-  '/root/.local/state/cursor/agent-stores/cursor_agent_stores/bc-f91f83f7-d8c2-501a-b929-f9b3ecf5829d/files/media';
+  '/root/.local/state/cursor/agent-stores/cursor_agent_stores/bc-49d94244-10a5-4a36-a7e1-22be46f6c8c8/files/media';
 
 const TENANT = 'bluebonnetpeakroofing';
 const EMAIL = 'jordan.hale+restart1790915600@mailinator.com';
