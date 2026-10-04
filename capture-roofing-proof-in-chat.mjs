@@ -193,7 +193,15 @@ if (INCLUDE_STORM_CANVASS) {
   );
 }
 
-const SUMMARY = path.join(MEDIA_DIR, 'roofing-proof-in-chat-summary.json');
+const SUMMARY_BASENAME = CHAT_LANE
+  ? `roofing-proof-in-chat-summary-${CHAT_LANE}.json`
+  : 'roofing-proof-in-chat-summary.json';
+const SUMMARY = path.join(MEDIA_DIR, SUMMARY_BASENAME);
+/** Coordinator chat embed paths (Cursor store); host writes PNGs to MEDIA_DIR. */
+const CURSOR_STORE_EMBED_PREFIX =
+  process.env.ROOFERZS_CURSOR_EMBED_PREFIX?.trim() ||
+  '/cursor/stores/bc-49d94244-10a5-4a36-a7e1-22be46f6c8c8/media';
+const EMBED_MANIFEST = path.join(MEDIA_DIR, 'roofing-proof-embed-manifest.json');
 const INTERNAL_FAIL_DIR = path.join(
   path.dirname(MEDIA_DIR),
   'internal',
@@ -734,9 +742,36 @@ async function openChatTarget(page) {
 function publishPass(outPath, scenarioId) {
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   if (!fs.existsSync(outPath)) return;
+  const fileName = path.basename(outPath);
+  const embedPath = `${CURSOR_STORE_EMBED_PREFIX}/${fileName}`;
   const stamp = path.join(MEDIA_DIR, `.roofing-pass-${scenarioId}.stamp`);
-  fs.writeFileSync(stamp, `${new Date().toISOString()}\n${outPath}\n`);
-  console.log(`[PASS] ${scenarioId} → ${outPath}`);
+  fs.writeFileSync(stamp, `${new Date().toISOString()}\n${embedPath}\n${outPath}\n`);
+  let manifest = {
+    automationLane: 'browserzs',
+    chatDisplayNote:
+      'User-facing chat walkthroughs: Cursor RecordScreen/computerUse. PNGs here are automation proof only.',
+    updatedAt: new Date().toISOString(),
+    passes: [],
+  };
+  if (fs.existsSync(EMBED_MANIFEST)) {
+    try {
+      manifest = { ...manifest, ...JSON.parse(fs.readFileSync(EMBED_MANIFEST, 'utf8')) };
+    } catch {
+      /* reset corrupt manifest */
+    }
+  }
+  manifest.updatedAt = new Date().toISOString();
+  manifest.passes = (manifest.passes || []).filter((p) => p.id !== scenarioId);
+  manifest.passes.push({
+    id: scenarioId,
+    fileName,
+    embedPath,
+    hostPath: outPath,
+    lane: CHAT_LANE || 'full',
+    passedAt: new Date().toISOString(),
+  });
+  fs.writeFileSync(EMBED_MANIFEST, JSON.stringify(manifest, null, 2));
+  console.log(`[PASS] ${scenarioId} embed=${embedPath}`);
 }
 
 const meta = {
